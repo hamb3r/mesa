@@ -271,7 +271,11 @@ d3d12_init_screen_caps(struct d3d12_screen *screen)
    caps->quads_follow_provoking_vertex_convention = true;
    caps->mixed_color_depth_bits = true;
 
-   caps->vertex_input_alignment = PIPE_VERTEX_INPUT_ALIGNMENT_4BYTE;
+   /* D3D11.3 Functional Spec 4.4.6 (Element Alignment) requires vertex input
+    * offsets and strides to be aligned to min(next_pow2(format_bytes), 4).
+    * Per-field alignment also satisfies UnrestrictedVertexElementAlignment.
+    */
+   caps->vertex_input_alignment = PIPE_VERTEX_INPUT_ALIGNMENT_FORMAT_MAX_4BYTE;
 
    /* We need to do some lowering that requires a link to the sampler */
    caps->nir_samplers_as_deref = true;
