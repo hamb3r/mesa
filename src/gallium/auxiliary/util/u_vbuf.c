@@ -469,6 +469,7 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
    struct pipe_resource *out_buffer = NULL;
    uint8_t *out_map;
    unsigned out_offset, mask;
+   enum pipe_error ret = PIPE_OK;
 
    /* Get a translate object. */
    tr = translate_cache_find(mgr->translate_cache, key);
@@ -551,8 +552,10 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
                      key->output_stride * draw->count, 4,
                      &out_offset, &out_buffer, releasebuf,
                      (void**)&out_map);
-      if (!out_buffer)
-         return PIPE_ERROR_OUT_OF_MEMORY;
+      if (!out_buffer) {
+         ret = PIPE_ERROR_OUT_OF_MEMORY;
+         goto out;
+      }
 
       if (info->has_user_indices) {
          map = (uint8_t*)info->index.user + offset;
@@ -585,14 +588,17 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
                      key->output_stride * num_vertices, 4,
                      &out_offset, &out_buffer, releasebuf,
                      (void**)&out_map);
-      if (!out_buffer)
-         return PIPE_ERROR_OUT_OF_MEMORY;
+      if (!out_buffer) {
+         ret = PIPE_ERROR_OUT_OF_MEMORY;
+         goto out;
+      }
 
       out_offset -= key->output_stride * start_vertex;
 
       tr->run(tr, 0, num_vertices, 0, 0, out_map);
    }
 
+out:
    /* Unmap all buffers. */
    mask = vb_mask;
    while (mask) {
@@ -602,6 +608,9 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
          pipe_buffer_unmap(mgr->pipe, vb_transfer[i]);
       }
    }
+
+   if (ret != PIPE_OK)
+      return ret;
 
    /* Setup the new vertex buffer. */
    mgr->real_vertex_buffer[out_vb].buffer_offset = out_offset;
@@ -613,16 +622,49 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
    return PIPE_OK;
 }
 
+static void
+u_vbuf_restore_real_vertex_buffer(struct u_vbuf *mgr, unsigned vb)
+{
+   if (vb < mgr->num_vertex_buffers &&
+       (mgr->enabled_vb_mask & BITFIELD_BIT(vb)) &&
+       !(mgr->user_vb_mask & BITFIELD_BIT(vb)) &&
+       !(mgr->incompatible_vb_mask & BITFIELD_BIT(vb))) {
+      mgr->real_vertex_buffer[vb] = mgr->vertex_buffer[vb];
+   } else {
+      memset(&mgr->real_vertex_buffer[vb], 0,
+             sizeof(mgr->real_vertex_buffer[vb]));
+   }
+}
+
+static void
+u_vbuf_restore_fallback_vbs(struct u_vbuf *mgr)
+{
+   for (unsigned i = 0; i < VB_NUM; i++) {
+      unsigned vb = mgr->fallback_vbs[i];
+      if (vb != ~0u) {
+         u_vbuf_restore_real_vertex_buffer(mgr, vb);
+         mgr->fallback_vbs[i] = ~0;
+      }
+   }
+   /* This will cause the fallback buffers above num_vertex_buffers to be
+    * unbound.
+    */
+   mgr->num_real_vertex_buffers = mgr->num_vertex_buffers;
+   mgr->vertex_buffers_dirty = true;
+   mgr->fallback_vbs_mask = 0;
+}
+
 static bool
 u_vbuf_translate_find_free_vb_slots(struct u_vbuf *mgr,
-                                    unsigned mask[VB_NUM])
+                                    unsigned mask[VB_NUM],
+                                    uint32_t retained_vb_mask)
 {
    unsigned type;
    unsigned fallback_vbs[VB_NUM];
-   /* Set the bit for each buffer which is incompatible, or isn't set. */
-   uint32_t unused_vb_mask =
-      mgr->ve->incompatible_vb_mask_all | mgr->incompatible_vb_mask | mgr->ve->incompatible_vb_mask |
-      ~mgr->enabled_vb_mask;
+   /* Set the bit for each allowed hardware slot not retained by any
+    * untranslated vertex element.
+    */
+   uint32_t unused_vb_mask = mgr->allowed_vb_mask & ~retained_vb_mask;
    uint32_t unused_vb_mask_orig;
    bool insufficient_buffers = false;
    uint32_t prev_mask = mgr->fallback_vbs_mask;
@@ -650,8 +692,8 @@ u_vbuf_translate_find_free_vb_slots(struct u_vbuf *mgr,
          if (prev_mask & BITFIELD_BIT(index)) {
             memset(&mgr->real_vertex_buffer[index], 0, sizeof(mgr->real_vertex_buffer[index]));
          }
-         mgr->fallback_vbs_mask |= 1 << index;
-         unused_vb_mask &= ~(1 << index);
+         mgr->fallback_vbs_mask |= BITFIELD_BIT(index);
+         unused_vb_mask &= ~BITFIELD_BIT(index);
          /*printf("found slot=%i for type=%i\n", index, type);*/
       }
    }
@@ -661,14 +703,22 @@ u_vbuf_translate_find_free_vb_slots(struct u_vbuf *mgr,
        * buffer */
       uint32_t index = ffs(unused_vb_mask_orig) - 1;
       /* When sharing one vertex buffer use per-vertex frequency for everything. */
+      memset(fallback_vbs, ~0, sizeof(fallback_vbs));
       fallback_vbs[VB_VERTEX] = index;
       if (prev_mask & BITFIELD_BIT(index)) {
          memset(&mgr->real_vertex_buffer[index], 0, sizeof(mgr->real_vertex_buffer[index]));
       }
-      mgr->fallback_vbs_mask = 1 << index;
+      mgr->fallback_vbs_mask = BITFIELD_BIT(index);
       mask[VB_VERTEX] = mask[VB_VERTEX] | mask[VB_CONST] | mask[VB_INSTANCE];
       mask[VB_CONST] = 0;
       mask[VB_INSTANCE] = 0;
+   }
+
+   uint32_t stale_mask = prev_mask & ~mgr->fallback_vbs_mask;
+   while (stale_mask) {
+      unsigned vb = u_bit_scan(&stale_mask);
+      u_vbuf_restore_real_vertex_buffer(mgr, vb);
+      mgr->vertex_buffers_dirty = true;
    }
 
    for (type = 0; type < VB_NUM; type++) {
@@ -692,6 +742,7 @@ u_vbuf_translate_begin(struct u_vbuf *mgr,
                        uint32_t misaligned, struct pipe_resource **releasebuf)
 {
    unsigned mask[VB_NUM] = {0};
+   uint32_t retained_vb_mask = 0;
    struct translate_key key[VB_NUM];
    unsigned elem_index[VB_NUM][PIPE_MAX_ATTRIBS]; /* ... into key.elements */
    unsigned i, type;
@@ -721,12 +772,14 @@ u_vbuf_translate_begin(struct u_vbuf *mgr,
       if (!mgr->ve->ve[i].src_stride) {
          if (!(mgr->ve->incompatible_elem_mask & (1 << i)) &&
              !(incompatible_vb_mask & (1 << vb_index))) {
+            retained_vb_mask |= BITFIELD_BIT(vb_index);
             continue;
          }
          mask[VB_CONST] |= 1 << vb_index;
       } else if (mgr->ve->ve[i].instance_divisor) {
          if (!(mgr->ve->incompatible_elem_mask & (1 << i)) &&
              !(incompatible_vb_mask & (1 << vb_index))) {
+            retained_vb_mask |= BITFIELD_BIT(vb_index);
             continue;
          }
          mask[VB_INSTANCE] |= 1 << vb_index;
@@ -734,6 +787,7 @@ u_vbuf_translate_begin(struct u_vbuf *mgr,
          if (!unroll_indices &&
              !(mgr->ve->incompatible_elem_mask & (1 << i)) &&
              !(incompatible_vb_mask & (1 << vb_index))) {
+            retained_vb_mask |= BITFIELD_BIT(vb_index);
             continue;
          }
          mask[VB_VERTEX] |= 1 << vb_index;
@@ -743,7 +797,7 @@ u_vbuf_translate_begin(struct u_vbuf *mgr,
    assert(mask[VB_VERTEX] || mask[VB_INSTANCE] || mask[VB_CONST]);
 
    /* Find free vertex buffer slots. */
-   if (!u_vbuf_translate_find_free_vb_slots(mgr, mask)) {
+   if (!u_vbuf_translate_find_free_vb_slots(mgr, mask, retained_vb_mask)) {
       return false;
    }
 
@@ -809,8 +863,11 @@ u_vbuf_translate_begin(struct u_vbuf *mgr,
                                         mask[type], mgr->fallback_vbs[type],
                                         start[type], num[type], min_index,
                                         unroll_indices && type == VB_VERTEX, releasebuf);
-         if (err != PIPE_OK)
+         if (err != PIPE_OK) {
+            if (!mgr->using_translate)
+               u_vbuf_restore_fallback_vbs(mgr);
             return false;
+         }
       }
    }
 
@@ -852,26 +909,11 @@ u_vbuf_translate_begin(struct u_vbuf *mgr,
 
 static void u_vbuf_translate_end(struct u_vbuf *mgr)
 {
-   unsigned i;
-
    /* Restore vertex elements. */
    mgr->pipe->bind_vertex_elements_state(mgr->pipe, mgr->ve->driver_cso);
    mgr->using_translate = false;
 
-   /* Release the now-unused VBOs. */
-   for (i = 0; i < VB_NUM; i++) {
-      unsigned vb = mgr->fallback_vbs[i];
-      if (vb != ~0u) {
-         memset(&mgr->real_vertex_buffer[vb], 0, sizeof(mgr->real_vertex_buffer[vb]));
-         mgr->fallback_vbs[i] = ~0;
-      }
-   }
-   /* This will cause the fallback buffers above num_vertex_buffers to be
-    * unbound.
-    */
-   mgr->num_real_vertex_buffers = mgr->num_vertex_buffers;
-   mgr->vertex_buffers_dirty = true;
-   mgr->fallback_vbs_mask = 0;
+   u_vbuf_restore_fallback_vbs(mgr);
 }
 
 static void *
@@ -1167,12 +1209,15 @@ u_vbuf_upload_buffers(struct u_vbuf *mgr,
          struct pipe_vertex_buffer *real_vb = &mgr->real_vertex_buffer[index];
          const uint8_t *ptr = mgr->vertex_buffer[index].buffer.user;
 
+         real_vb->buffer.resource = NULL;
          u_upload_data(mgr->pipe->stream_uploader,
                        mgr->has_signed_vb_offset ? 0 : offset,
                        size, 4, ptr + offset, &real_vb->buffer_offset,
                        &real_vb->buffer.resource, &releasebufs[rcount]);
-         if (!real_vb->buffer.resource)
+         if (!real_vb->buffer.resource) {
+            *release_count = rcount;
             return PIPE_ERROR_OUT_OF_MEMORY;
+         }
 
          if (releasebufs[rcount])
             rcount++;
@@ -1231,12 +1276,15 @@ u_vbuf_upload_buffers(struct u_vbuf *mgr,
       real_vb = &mgr->real_vertex_buffer[i];
       ptr = mgr->vertex_buffer[i].buffer.user;
 
+      real_vb->buffer.resource = NULL;
       u_upload_data(mgr->pipe->stream_uploader,
                     mgr->has_signed_vb_offset ? 0 : start,
                     end - start, 4,
                     ptr + start, &real_vb->buffer_offset, &real_vb->buffer.resource, &releasebufs[rcount]);
-      if (!real_vb->buffer.resource)
+      if (!real_vb->buffer.resource) {
+         *release_count = rcount;
          return PIPE_ERROR_OUT_OF_MEMORY;
+      }
 
       if (releasebufs[rcount])
          rcount++;
@@ -1646,8 +1694,13 @@ void u_vbuf_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *inf
                return;
          }
       } else {
-         if ((!indirect && !new_draw.count) || !new_info.instance_count)
-            return;
+         if (!new_info.instance_count)
+            goto out;
+         if (!indirect && !new_draw.count) {
+            if (info->increment_draw_id)
+               drawid_offset++;
+            continue;
+         }
       }
 
       if (new_info.index_size) {
@@ -1768,11 +1821,11 @@ void u_vbuf_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *inf
          drawid_offset++;
    }
 
+out:
    if (mgr->using_translate) {
       u_vbuf_translate_end(mgr);
    }
 
-out:
    pipe_resource_release(pipe, releasebuf);
    for (unsigned i = 0; i < release_count; i++)
       pipe_resource_release(pipe, releasebufs[i]);
