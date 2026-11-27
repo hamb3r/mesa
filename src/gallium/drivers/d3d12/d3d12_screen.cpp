@@ -41,6 +41,10 @@
 #include "d3d12_residency.h"
 #include "d3d12_resource.h"
 #include "pipebuffer/pb_bufmgr.h"
+#include "util/u_call_once.h"
+#ifndef _WIN32
+#include "util/u_cpu_detect.h"
+#endif
 #include "util/u_debug.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
@@ -81,6 +85,18 @@ DEBUG_GET_ONCE_FLAGS_OPTION(d3d12_debug, "D3D12_DEBUG", d3d12_debug_options, 0)
 
 uint32_t
 d3d12_debug;
+
+/* On WSL, the first CPU read of a D3D12 readback staging buffer mapped through
+ * /dev/dxg can take hundreds of milliseconds because pages are faulted in
+ * serially across VMBus. Split larger frontbuffer readbacks into horizontal
+ * bands so the page faults happen in parallel. Smaller copies stay on the
+ * calling thread, where thread wakeup overhead would dominate.
+ */
+#define D3D12_FRONTBUFFER_COPY_DEFAULT_THREADS 8
+#define D3D12_FRONTBUFFER_COPY_MAX_THREADS 32
+#define D3D12_FRONTBUFFER_COPY_MIN_BYTES (UINT64_C(512) * 1024)
+static_assert(D3D12_FRONTBUFFER_COPY_DEFAULT_THREADS <= D3D12_FRONTBUFFER_COPY_MAX_THREADS,
+              "default frontbuffer copy thread count exceeds maximum");
 
 enum {
     HW_VENDOR_AMD                   = 0x1002,
@@ -671,6 +687,9 @@ d3d12_deinit_screen(struct d3d12_screen *screen)
 void
 d3d12_destroy_screen(struct d3d12_screen *screen)
 {
+   if (util_queue_is_initialized(&screen->frontbuffer_copy_queue))
+      util_queue_destroy(&screen->frontbuffer_copy_queue);
+
    slab_destroy_parent(&screen->transfer_pool);
    mtx_destroy(&screen->submit_mutex);
    mtx_destroy(&screen->pending_free_lock);
@@ -687,6 +706,120 @@ d3d12_destroy_screen(struct d3d12_screen *screen)
    glsl_type_singleton_decref();
 #endif // HAVE_GALLIUM_D3D12_GRAPHICS
    FREE(screen);
+}
+
+struct d3d12_frontbuffer_copy_job {
+   void *dst;
+   const void *src;
+   enum pipe_format format;
+   unsigned dst_stride;
+   int src_stride;
+   unsigned width;
+   unsigned first_row;
+   unsigned row_count;
+   struct util_queue_fence fence;
+};
+
+static void
+d3d12_frontbuffer_copy_job_execute(void *data, void *, int)
+{
+   struct d3d12_frontbuffer_copy_job *job =
+      (struct d3d12_frontbuffer_copy_job *)data;
+
+   util_copy_rect(job->dst, job->format, job->dst_stride,
+                  0, job->first_row, job->width, job->row_count,
+                  job->src, job->src_stride, 0, job->first_row);
+}
+
+static void
+d3d12_init_frontbuffer_copy_queue(const void *data)
+{
+   struct d3d12_screen *screen = (struct d3d12_screen *)data;
+   const unsigned num_threads = screen->frontbuffer_copy_target_threads;
+
+   if (util_queue_init(&screen->frontbuffer_copy_queue, "d3d12-fb",
+                       num_threads * 2, num_threads,
+                       UTIL_QUEUE_INIT_RESIZE_IF_FULL |
+                       UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY,
+                       nullptr)) {
+      /* util_queue starts with 1 thread and scales up on demand; start all
+       * workers up front so the first large readback faults in parallel.
+       */
+      util_queue_adjust_num_threads(&screen->frontbuffer_copy_queue,
+                                    num_threads);
+      screen->frontbuffer_copy_threads =
+         screen->frontbuffer_copy_queue.num_threads;
+   }
+}
+
+static void
+d3d12_copy_frontbuffer(struct d3d12_screen *screen,
+                       void *dst, unsigned dst_stride,
+                       const void *src, int src_stride,
+                       enum pipe_format format,
+                       unsigned width, unsigned height)
+{
+   if (!screen->frontbuffer_copy_target_threads ||
+       dst_stride == 0 || src_stride <= 0 || height < 2 ||
+       util_format_get_blockheight(format) != 1) {
+      util_copy_rect(dst, format, dst_stride, 0, 0, width, height,
+                     src, src_stride, 0, 0);
+      return;
+   }
+
+   const unsigned blockwidth = util_format_get_blockwidth(format);
+   const uint64_t copy_bytes =
+      (uint64_t)DIV_ROUND_UP(width, blockwidth) * height *
+      util_format_get_blocksize(format);
+   if (copy_bytes < D3D12_FRONTBUFFER_COPY_MIN_BYTES) {
+      util_copy_rect(dst, format, dst_stride, 0, 0, width, height,
+                     src, src_stride, 0, 0);
+      return;
+   }
+
+   util_call_once_data_slow(&screen->frontbuffer_copy_once,
+                            d3d12_init_frontbuffer_copy_queue, screen);
+   const unsigned num_threads = screen->frontbuffer_copy_threads;
+   if (!num_threads) {
+      util_copy_rect(dst, format, dst_stride, 0, 0, width, height,
+                     src, src_stride, 0, 0);
+      return;
+   }
+
+   const unsigned num_bands = MIN2(num_threads + 1, height);
+   const unsigned num_jobs = num_bands - 1;
+   struct d3d12_frontbuffer_copy_job jobs[D3D12_FRONTBUFFER_COPY_MAX_THREADS - 1];
+   assert(num_jobs <= ARRAY_SIZE(jobs));
+
+   for (unsigned i = 0; i < num_jobs; i++) {
+      struct d3d12_frontbuffer_copy_job *job = &jobs[i];
+
+      job->dst = dst;
+      job->src = src;
+      job->format = format;
+      job->dst_stride = dst_stride;
+      job->src_stride = src_stride;
+      job->width = width;
+      job->first_row = (unsigned)((uint64_t)height * (i + 1) / num_bands);
+      job->row_count =
+         (unsigned)((uint64_t)height * (i + 2) / num_bands) - job->first_row;
+
+      util_queue_fence_init(&job->fence);
+      util_queue_add_job(&screen->frontbuffer_copy_queue, job, &job->fence,
+                         d3d12_frontbuffer_copy_job_execute, nullptr,
+                         sizeof(*job));
+   }
+
+   /* Copy the first band on the calling thread while the workers handle the
+    * rest, so the copy uses all configured threads.
+    */
+   util_copy_rect(dst, format, dst_stride, 0, 0, width,
+                  height / num_bands, src, src_stride, 0, 0);
+
+   for (unsigned i = 0; i < num_jobs; i++) {
+      util_queue_fence_wait(&jobs[i].fence);
+      util_queue_fence_destroy(&jobs[i].fence);
+   }
 }
 
 static void
@@ -739,9 +872,10 @@ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
                                         u_minify(pres->height0, level),
                                         &transfer);
       if (res_map) {
-         util_copy_rect((uint8_t*)map, pres->format, res->dt_stride, 0, 0,
-                        transfer->box.width, transfer->box.height,
-                        (const uint8_t*)res_map, transfer->stride, 0, 0);
+         d3d12_copy_frontbuffer(screen, map, res->dt_stride,
+                                res_map, transfer->stride,
+                                pres->format,
+                                transfer->box.width, transfer->box.height);
          pipe_texture_unmap(pctx, transfer);
       }
       winsys->displaytarget_unmap(winsys, res->dt);
@@ -1371,6 +1505,39 @@ d3d12_query_memory_info(struct pipe_screen *pscreen, struct pipe_memory_info *in
    info->nr_device_memory_evictions = screen->num_evictions;
 }
 
+static unsigned
+d3d12_get_frontbuffer_copy_worker_threads(void)
+{
+   /* Total number of threads used for large frontbuffer readbacks (the calling
+    * thread copies one band), or 0 for the platform default. 1 disables the
+    * parallel copy.
+    */
+   int64_t requested_threads =
+      debug_get_num_option("D3D12_FRONTBUFFER_THREADS", 0);
+
+   if (requested_threads == 0) {
+#ifdef _WIN32
+      /* Native Windows readback is fast enough already, and extra threads
+       * would only add overhead. */
+      return 0;
+#else
+      /* On Linux, d3d12 is only usable through WSL, where the first CPU read
+       * of a D3D12 readback staging buffer mapped through /dev/dxg faults in
+       * pages serially across VMBus. */
+      const int nr_cpus = util_get_cpu_caps()->nr_cpus;
+      requested_threads =
+         MIN2(nr_cpus, D3D12_FRONTBUFFER_COPY_DEFAULT_THREADS);
+#endif
+   } else if (requested_threads > D3D12_FRONTBUFFER_COPY_MAX_THREADS) {
+      requested_threads = D3D12_FRONTBUFFER_COPY_MAX_THREADS;
+   }
+
+   if (requested_threads <= 1)
+      return 0;
+
+   return (unsigned)requested_threads - 1;
+}
+
 bool
 d3d12_init_screen_base(struct d3d12_screen *screen, struct sw_winsys *winsys, LUID *adapter_luid)
 {
@@ -1382,6 +1549,11 @@ d3d12_init_screen_base(struct d3d12_screen *screen, struct sw_winsys *winsys, LU
    screen->winsys = winsys;
    if (adapter_luid)
       screen->adapter_luid = *adapter_luid;
+   const once_flag once_init = ONCE_FLAG_INIT;
+   screen->frontbuffer_copy_once = once_init;
+   if (winsys)
+      screen->frontbuffer_copy_target_threads =
+         d3d12_get_frontbuffer_copy_worker_threads();
    mtx_init(&screen->descriptor_pool_mutex, mtx_plain);
    mtx_init(&screen->submit_mutex, mtx_plain);
    mtx_init(&screen->pending_free_lock, mtx_plain);

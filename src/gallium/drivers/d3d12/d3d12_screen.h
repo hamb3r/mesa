@@ -26,7 +26,9 @@
 
 #include "pipe/p_screen.h"
 
+#include "c11/threads.h"
 #include "util/slab.h"
+#include "util/u_queue.h"
 #include "d3d12_descriptor_pool.h"
 
 #include "util/list.h"
@@ -93,6 +95,10 @@ struct d3d12_screen {
    mtx_t varying_info_mutex;
 
    struct slab_parent_pool transfer_pool;
+   once_flag frontbuffer_copy_once;
+   struct util_queue frontbuffer_copy_queue;
+   unsigned frontbuffer_copy_target_threads;
+   unsigned frontbuffer_copy_threads;
    struct pb_manager *bufmgr;
    struct pb_manager *cache_bufmgr;
    struct pb_manager *slab_cache_bufmgr;

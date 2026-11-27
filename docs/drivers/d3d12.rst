@@ -63,3 +63,11 @@ Environment variables that control the behavior of the D3D12 driver.
    run on. The first adapter matching the substring is chosen. The substring
    is not case sensitive.
 
+.. envvar:: D3D12_FRONTBUFFER_THREADS
+
+   Total number of threads used to copy large frontbuffer readbacks (at
+   least 512 KiB) to a software display target, including the calling
+   thread. ``0`` (default) selects automatic behavior: serial on Windows,
+   and up to 8 threads (capped by CPU count) on Linux/WSL. ``1`` forces
+   serial copies; values from ``2`` to ``32`` split the copy into that many
+   horizontal bands (higher values are clamped to ``32``).
