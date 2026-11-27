@@ -45,12 +45,8 @@ struct u_vbuf;
 struct u_vbuf_caps {
    enum pipe_format format_translation[PIPE_FORMAT_COUNT];
 
-   /* Whether vertex fetches don't have to be 4-byte-aligned. */
-   /* TRUE if hardware supports it. */
-   unsigned attrib_4byte_unaligned:1;
-   /* Whether vertex fetches don't have to be element-aligned. */
-   /* TRUE if hardware supports it. */
-   unsigned attrib_element_unaligned:1;
+   /* Hardware vertex fetcher alignment limitation. */
+   enum pipe_vertex_input_alignment vertex_input_alignment;
 
    /* Whether the driver supports user vertex buffers. */
    unsigned user_vertex_buffers:1;

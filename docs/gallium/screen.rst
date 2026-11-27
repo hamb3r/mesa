@@ -138,6 +138,12 @@ Capability about the features and limits of the driver/GPU.
   ``pipe_vertex_element::src_offset + pipe_vertex_buffer::buffer_offset + pipe_vertex_buffer::stride``
   must always be aligned to the component size for the vertex attributes
   which access that buffer.
+  If ``PIPE_VERTEX_INPUT_ALIGNMENT_FORMAT_MAX_4BYTE``,
+  ``pipe_vertex_element::src_offset``, ``pipe_vertex_buffer::buffer_offset``,
+  and ``pipe_vertex_element::src_stride`` must each be aligned to the nearest
+  power of 2 greater than or equal to the byte size of the element's format,
+  clamped to 4 bytes (1 byte for 1-byte formats, 2 bytes for 2-byte formats,
+  and 4 bytes for formats of 3 bytes or larger).
   If ``PIPE_VERTEX_INPUT_ALIGNMENT_NONE``, there are no restrictions on these values.
 * ``pipe_caps.compute``: Whether the implementation supports the
   compute entry points defined in pipe_context and pipe_screen.
